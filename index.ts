@@ -64,6 +64,8 @@ export class CloudWatchLogs {
 	private static lastFlush = Date.now();
 	private static sequenceToken: string | undefined = undefined;
 
+	private static logGroupsStatus: Map<string, string[]> = new Map();
+
 	// --------------------------------------------------------------------------
 	// https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/cloudwatch_limits_cwl.html
 	private static readonly MAX_EVENT_SIZE = 2 ** 10 * 256; // 256 Kb
@@ -73,6 +75,7 @@ export class CloudWatchLogs {
 	private static readonly MAX_BUFFER_SIZE = 1_048_576;
 
 	private static bufferedLogs = new Map<`${string}{::}${string}`, Log[]>();
+
 	private static pushLog(
 		logGroupName: string,
 		logStreamName: string,
@@ -148,76 +151,101 @@ export class CloudWatchLogs {
 	/**
 	 * @throws {Error} if CloudWatchLogs client is not initialized.
 	 */
-	private static async createLogGroup(logGroupName: string) {
-		if (!CloudWatchLogs.client) {
-			throw new Error("CloudWatchLogs client is not initialized.");
+	private static createLogGroup(logGroupName: string) {
+		if (!CloudWatchLogs.throttle) {
+			throw new Error("CloudWatchLogs `throttle` is not initialized.");
 		}
 
-		try {
-			await CloudWatchLogs.client.send(
-				new CreateLogGroupCommand({ logGroupName }),
-			);
-		} catch (error: unknown) {
-			if (CloudWatchLogs.isResourceAlreadyExistsException(error)) {
-				return;
+		return CloudWatchLogs.throttle(async () => {
+			if (!CloudWatchLogs.client) {
+				throw new Error("CloudWatchLogs `client` is not initialized.");
 			}
-			throw new Error("Create Log Group Failed", { cause: error });
-		}
+
+			try {
+				await CloudWatchLogs.client.send(
+					new CreateLogGroupCommand({ logGroupName }),
+				);
+			} catch (error) {
+				if (CloudWatchLogs.isResourceAlreadyExistsException(error)) {
+					return;
+				}
+				throw new Error("Create Log Group Failed", { cause: error });
+			}
+		})();
 	}
 
 	/**
 	 * @throws {Error} if CloudWatchLogs client is not initialized.
 	 */
-	private static async createLogStream(
-		logGroupName: string,
-		logStreamName: string,
-	) {
-		if (!CloudWatchLogs.client) {
-			throw new Error("CloudWatchLogs client is not initialized.");
+	private static createLogStream(logGroupName: string, logStreamName: string) {
+		if (!CloudWatchLogs.throttle) {
+			throw new Error("CloudWatchLogs `throttle` is not initialized.");
 		}
 
-		try {
-			await CloudWatchLogs.client.send(
-				new CreateLogStreamCommand({
+		return CloudWatchLogs.throttle(async () => {
+			if (!CloudWatchLogs.client) {
+				throw new Error("CloudWatchLogs `client` is not initialized.");
+			}
+
+			try {
+				await CloudWatchLogs.createLogGroup(logGroupName);
+
+				await CloudWatchLogs.client.send(
+					new CreateLogStreamCommand({
+						logGroupName,
+						logStreamName,
+					}),
+				);
+
+				const logGroup = CloudWatchLogs.logGroupsStatus.get(logGroupName);
+				if (!logGroup) {
+					CloudWatchLogs.logGroupsStatus.set(logGroupName, [logStreamName]);
+				} else {
+					logGroup.push(logStreamName);
+				}
+			} catch (error) {
+				if (CloudWatchLogs.isResourceAlreadyExistsException(error)) {
+					return;
+				}
+
+				throw new Error("Create Log Stream Failed", { cause: error });
+			}
+		})();
+	}
+
+	/**
+	 * @throws {Error} if CloudWatchLogs client is not initialized.
+	 */
+	private static nextToken(logGroupName: string, logStreamName: string) {
+		if (!CloudWatchLogs.throttle) {
+			throw new Error("CloudWatchLogs `throttle` is not initialized.");
+		}
+
+		return CloudWatchLogs.throttle(async () => {
+			if (!CloudWatchLogs.client) {
+				throw new Error("CloudWatchLogs client is not initialized.");
+			}
+
+			const output = await CloudWatchLogs.client.send(
+				new DescribeLogStreamsCommand({
 					logGroupName,
-					logStreamName,
+					logStreamNamePrefix: logStreamName,
 				}),
 			);
-		} catch (error: unknown) {
-			if (CloudWatchLogs.isResourceAlreadyExistsException(error)) {
-				return;
+
+			if (output.logStreams?.length === 0) {
+				throw new Error("LogStream not found.");
 			}
 
-			throw new Error("Create Log Stream Failed", { cause: error });
-		}
+			CloudWatchLogs.sequenceToken =
+				output.logStreams?.[0]?.uploadSequenceToken;
+		})();
 	}
 
 	/**
 	 * @throws {Error} if CloudWatchLogs client is not initialized.
 	 */
-	private static async nextToken(logGroupName: string, logStreamName: string) {
-		if (!CloudWatchLogs.client) {
-			throw new Error("CloudWatchLogs client is not initialized.");
-		}
-
-		const output = await CloudWatchLogs.client.send(
-			new DescribeLogStreamsCommand({
-				logGroupName,
-				logStreamNamePrefix: logStreamName,
-			}),
-		);
-
-		if (output.logStreams?.length === 0) {
-			throw new Error("LogStream not found.");
-		}
-
-		CloudWatchLogs.sequenceToken = output.logStreams?.[0]?.uploadSequenceToken;
-	}
-
-	/**
-	 * @throws {Error} if CloudWatchLogs client is not initialized.
-	 */
-	private static async putEventLogs(
+	private static putEventLogs(
 		logGroupName: string,
 		logStreamName: string,
 		logEvents: Log[],
@@ -226,64 +254,75 @@ export class CloudWatchLogs {
 			return;
 		}
 
-		if (!CloudWatchLogs.client) {
-			throw new Error("CloudWatchLogs client is not initialized.");
+		if (!CloudWatchLogs.throttle) {
+			throw new Error("CloudWatchLogs `throttle` is not initialized.");
 		}
 
-		try {
-			const output = await CloudWatchLogs.client.send(
-				new PutLogEventsCommand({
-					logEvents,
-					logGroupName,
-					logStreamName,
-					sequenceToken: CloudWatchLogs.sequenceToken,
-				}),
-			);
-
-			CloudWatchLogs.sequenceToken = output.nextSequenceToken;
-		} catch (error: unknown) {
-			if (CloudWatchLogs.isInvalidSequenceTokenException(error)) {
-				CloudWatchLogs.sequenceToken = error.expectedSequenceToken;
-			} else {
-				throw new Error("Put Log Events Failed", { cause: error });
+		return CloudWatchLogs.throttle(async () => {
+			if (!CloudWatchLogs.client) {
+				throw new Error("CloudWatchLogs client is not initialized.");
 			}
-		}
+
+			try {
+				if (
+					!CloudWatchLogs.logGroupsStatus
+						.get(logGroupName)
+						?.includes(logStreamName)
+				) {
+					await CloudWatchLogs.createLogStream(logGroupName, logStreamName);
+				}
+
+				const output = await CloudWatchLogs.client.send(
+					new PutLogEventsCommand({
+						logEvents,
+						logGroupName,
+						logStreamName,
+						sequenceToken: CloudWatchLogs.sequenceToken,
+					}),
+				);
+
+				CloudWatchLogs.sequenceToken = output.nextSequenceToken;
+			} catch (error) {
+				if (CloudWatchLogs.isInvalidSequenceTokenException(error)) {
+					CloudWatchLogs.sequenceToken = error.expectedSequenceToken;
+				} else {
+					throw new Error("Put Log Events Failed", { cause: error });
+				}
+			}
+		})();
 	}
 
 	/**
 	 * @throws {Error} if CloudWatchLogs throttle is not initialized.
 	 */
-	static get flush() {
-		if (!CloudWatchLogs.throttle) {
-			throw new Error("CloudWatchLogs throttle is not initialized.");
-		}
+	static async flush() {
+		try {
+			CloudWatchLogs.orderLogs();
 
-		return CloudWatchLogs.throttle(async () => {
-			try {
-				CloudWatchLogs.orderLogs();
+			const entries = Array.from(CloudWatchLogs.bufferedLogs.entries());
+			CloudWatchLogs.wipeLogs();
 
-				const entries = Array.from(CloudWatchLogs.bufferedLogs.entries());
-				CloudWatchLogs.wipeLogs();
-
-				for (const [key, logs] of entries) {
-					const [groupName, streamName] = key.split("{::}") as [string, string];
-					await CloudWatchLogs.putEventLogs(groupName, streamName, logs);
-				}
-			} catch (e: unknown) {
-				await CloudWatchLogs.addErrorLog("cloudwatch_logger", "errors", {
-					message: "flushing error",
-					error: String(e),
-				});
-			} finally {
-				CloudWatchLogs.lastFlush = Date.now();
+			for (const [key, logs] of entries) {
+				const [groupName, streamName] = key.split("{::}") as [string, string];
+				await CloudWatchLogs.putEventLogs(groupName, streamName, logs);
 			}
-		});
+		} catch (e) {
+			console.error(e);
+			await CloudWatchLogs.addErrorLog("cloudwatch_logger", "errors", {
+				message: "flushing error",
+				error: String(e),
+			});
+		} finally {
+			CloudWatchLogs.lastFlush = Date.now();
+		}
 	}
 
-	//
+	// ---- instance
 
 	readonly logGroupName: string;
 	readonly logStreamName: string;
+
+	readonly initializationPromise: Promise<void>;
 
 	/**
 	 * @throws {Error} if CloudWatchLogs client is not initialized.
@@ -298,7 +337,7 @@ export class CloudWatchLogs {
 		logStreamName: string;
 
 		options?: {
-			/** @default "CloudWatcLogsErrors" */
+			/** @default "CloudWatchLogsErrors" */
 			errorLogGroupName?: string;
 		};
 	}) {
@@ -309,14 +348,9 @@ export class CloudWatchLogs {
 		this.logGroupName = logGroupName;
 		this.logStreamName = logStreamName;
 
-		this.initialize(
-			Object.assign(
-				{
-					errorLogGroupName: "CloudWatcLogsErrors",
-				},
-				options,
-			),
-		);
+		this.initializationPromise = this.initialize({
+			errorLogGroupName: options?.errorLogGroupName ?? "CloudWatchLogsErrors",
+		});
 	}
 
 	private async initialize(options: { errorLogGroupName: string }) {
