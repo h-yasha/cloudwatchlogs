@@ -15,8 +15,10 @@
 		"moduleResolution": "Bundler",
 		"module": "ESNext",
 		"noEmit": true,
+		"noImplicitReturns": true,
 
 		"lib": ["es2022"]
 	},
+	"include": ["index.ts"],
 	"exclude": ["node_modules", "dist"]
 }
