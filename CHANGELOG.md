@@ -1,5 +1,11 @@
 # @purpleduck/cloudwatch-logs
 
+## 0.1.1
+
+### Patch Changes
+
+- d7956eb: add export for cloudwatch specific constants
+
 ## 0.0.4
 
 ### Patch Changes
