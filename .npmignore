@@ -1,4 +1,10 @@
 pg
+.husky
+.github
+bunfig.toml
+bun.lockb
+biome.json
+commitlint.config.mjs
 
 # Based on https://raw.githubusercontent.com/github/gitignore/main/Node.gitignore
 
