@@ -16,11 +16,12 @@ export interface Log extends InputLogEvent {
 
 // https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/cloudwatch_limits_cwl.html
 // https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutLogEvents.html
-const FIXED_EVENT_PREFIX = 26 /* byte */;
-const MAX_EVENT_SIZE = 2 ** 18 - FIXED_EVENT_PREFIX /* byte */; // 256 KB - 26 bytes.
+export const CLOUDWATCH_FIXED_EVENT_PREFIX = 26 /* byte */;
+export const CLOUDWATCH_MAX_EVENT_SIZE =
+	2 ** 18 - CLOUDWATCH_FIXED_EVENT_PREFIX /* byte */; // 256 KB - 26 bytes.
 
-const MAX_BUFFER_LENGTH = 10_000;
-const MAX_BUFFER_SIZE = 2 ** 20 /* byte */; // 1 MB
+export const CLOUDWTACH_MAX_BUFFER_LENGTH = 10_000;
+export const CLOUDWATCH_MAX_BUFFER_SIZE = 2 ** 20 /* byte */; // 1 MB
 
 function isResourceAlreadyExistsException(
 	error: unknown,
@@ -123,7 +124,7 @@ function reachedBufferLimits(
 		return false;
 	}
 
-	if (logs.length + 1 >= MAX_BUFFER_LENGTH) {
+	if (logs.length + 1 >= CLOUDWTACH_MAX_BUFFER_LENGTH) {
 		return true;
 	}
 
@@ -134,11 +135,11 @@ function reachedBufferLimits(
 
 	const messageSize = Buffer.byteLength(newLog.message, "utf-8");
 
-	return size + messageSize >= MAX_BUFFER_SIZE;
+	return size + messageSize >= CLOUDWATCH_MAX_BUFFER_SIZE;
 }
 
 function logEventExceedsSize(log: Log): boolean {
-	return Buffer.byteLength(log.message, "utf-8") >= MAX_EVENT_SIZE;
+	return Buffer.byteLength(log.message, "utf-8") >= CLOUDWATCH_MAX_EVENT_SIZE;
 }
 
 function getOrderedLogs(): Array<
@@ -283,6 +284,11 @@ async function _flush(
 	}
 }
 
+/**
+ * internal function used to add log messages to the buffer.
+ *
+ * can return {@link Error} when {@link clipMessages} is set to false.
+ **/
 export function addLog(
 	logGroupName: string,
 	logStreamName: string,
@@ -297,7 +303,7 @@ export function addLog(
 	if (logEventExceedsSize(log)) {
 		if (clipMessages) {
 			const message = Buffer.from(log.message)
-				.slice(0, MAX_EVENT_SIZE)
+				.slice(0, CLOUDWATCH_MAX_EVENT_SIZE)
 				.toString();
 
 			log_ = { timestamp: log.timestamp, message };
