@@ -1,5 +1,11 @@
 # @purpleduck/cloudwatch-logs
 
+## 0.1.2
+
+### Patch Changes
+
+- 158e297: bug fix
+
 ## 0.1.1
 
 ### Patch Changes
