@@ -129,11 +129,15 @@ function reachedBufferLimits(
 	}
 
 	const size = logs.reduce(
-		(accumulator, log) => accumulator + Buffer.byteLength(log.message, "utf-8"),
+		(accumulator, log) =>
+			accumulator +
+			Buffer.byteLength(log.message, "utf-8") +
+			CLOUDWATCH_FIXED_EVENT_PREFIX,
 		0,
 	);
 
-	const messageSize = Buffer.byteLength(newLog.message, "utf-8");
+	const messageSize =
+		Buffer.byteLength(newLog.message, "utf-8") + CLOUDWATCH_FIXED_EVENT_PREFIX;
 
 	return size + messageSize >= CLOUDWATCH_MAX_BUFFER_SIZE;
 }
