@@ -287,6 +287,13 @@ async function _flush(
 					_error: error,
 					cause: String((error as Error).cause),
 					stack: String((error as Error).stack),
+					groupName,
+					streamName,
+					logsCount: logs.length,
+					logsRawTotalSize: logs.reduce(
+						(acc, log) => acc + Buffer.byteLength(log.message),
+						0,
+					),
 				});
 
 				if (!logs.length) {
@@ -296,7 +303,7 @@ async function _flush(
 				const half = logs.length / 2;
 
 				while (logs.length) {
-					const partial = logs.splice(half);
+					const partial = logs.splice(0, half);
 					await putEventLogs(groupName, streamName, partial);
 				}
 			}
