@@ -169,7 +169,7 @@ function getOrderedLogs(): Array<
 async function addErrorLog(
 	groupName: string,
 	streamName: string,
-	errorLog: { message: string; error: string },
+	errorLog: { message: string; error: string } & Record<string, unknown>,
 ): Promise<void> {
 	pushLog(groupName, streamName, {
 		timestamp: Date.now(),
@@ -275,16 +275,41 @@ export function flush(): Promise<void> {
 async function _flush(
 	entries: ReturnType<typeof getOrderedLogs>,
 ): Promise<void> {
-	try {
-		for (const [groupName, streamName, logs] of entries) {
-			await putEventLogs(groupName, streamName, logs);
+	for (const [groupName, streamName, logs] of entries) {
+		try {
+			try {
+				await putEventLogs(groupName, streamName, logs);
+			} catch (error) {
+				console.error(error);
+				await addErrorLog("cloudwatch_logger", "errors", {
+					message: "flushing error (will retry)",
+					error: String(error),
+					_error: error,
+					cause: String((error as Error).cause),
+					stack: String((error as Error).stack),
+				});
+
+				if (!logs.length) {
+					continue;
+				}
+
+				const half = logs.length / 2;
+
+				while (logs.length) {
+					const partial = logs.splice(half);
+					await putEventLogs(groupName, streamName, partial);
+				}
+			}
+		} catch (error) {
+			console.error(error);
+			await addErrorLog("cloudwatch_logger", "errors", {
+				message: "flushing error",
+				error: String(error),
+				_error: error,
+				cause: String((error as Error).cause),
+				stack: String((error as Error).stack),
+			});
 		}
-	} catch (error) {
-		console.error(error);
-		await addErrorLog("cloudwatch_logger", "errors", {
-			message: "flushing error",
-			error: String(error),
-		});
 	}
 }
 
