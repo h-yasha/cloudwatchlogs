@@ -1,5 +1,11 @@
 # @purpleduck/cloudwatch-logs
 
+## 0.1.5
+
+### Patch Changes
+
+- 368455e: fix incorrect usage of array#splice
+
 ## 0.1.4
 
 ### Patch Changes
