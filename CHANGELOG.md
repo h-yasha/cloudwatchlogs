@@ -1,5 +1,11 @@
 # @purpleduck/cloudwatch-logs
 
+## 0.1.4
+
+### Patch Changes
+
+- 3b2bf80: fix: try catch on every log entry intead of all and add retry
+
 ## 0.1.2
 
 ### Patch Changes
