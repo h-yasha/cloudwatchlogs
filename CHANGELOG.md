@@ -1,5 +1,11 @@
 # @purpleduck/cloudwatch-logs
 
+## 0.2.0
+
+### Minor Changes
+
+- d83628e: refactor throttling and log groups caching
+
 ## 0.1.5
 
 ### Patch Changes
