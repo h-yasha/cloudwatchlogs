@@ -7,7 +7,7 @@ import {
 	PutLogEventsCommand,
 	ResourceAlreadyExistsException,
 } from "@aws-sdk/client-cloudwatch-logs";
-import pThrottle from "p-throttle";
+// import pThrottle from "p-throttle";
 
 const DEBUG = !!process.env.DUCK_LOGGER_DEBUG;
 function debug(message: string, ...optionalParams: unknown[]) {
@@ -46,10 +46,10 @@ function isResourceAlreadyExistsException(
 
 //
 
-const throttle = pThrottle({
-	interval: 50,
-	limit: 1,
-});
+// const throttle = pThrottle({
+// 	interval: 50,
+// 	limit: 1,
+// });
 
 let client: CloudWatchLogsClient | undefined;
 
@@ -148,7 +148,7 @@ function reachedBufferLimits(
 	const messageSize =
 		Buffer.byteLength(newLog.message, "utf-8") + CLOUDWATCH_FIXED_EVENT_PREFIX;
 
-	return size + messageSize >= CLOUDWATCH_MAX_BUFFER_SIZE;
+	return size + messageSize >= CLOUDWATCH_MAX_BUFFER_SIZE - 1024;
 }
 
 function logEventExceedsSize(log: Log): boolean {
@@ -176,17 +176,27 @@ function getOrderedLogs(): Array<
 }
 
 // TODO: instantly log out
-async function addErrorLog(
+function addErrorLog(
 	groupName: string,
 	streamName: string,
 	errorLog: { message: string; error: string } & Record<string, unknown>,
-): Promise<void> {
-	pushLog(groupName, streamName, {
-		timestamp: Date.now(),
-		message: JSON.stringify(errorLog),
-	});
+): void {
+	if (!client) {
+		throw new Error("CloudWatchLogs `client` is not initialized.");
+	}
 
-	await flush();
+	client.send(
+		new PutLogEventsCommand({
+			logGroupName: groupName,
+			logStreamName: streamName,
+			logEvents: [
+				{
+					timestamp: Date.now(),
+					message: JSON.stringify(errorLog),
+				},
+			],
+		}),
+	);
 }
 
 /**
@@ -259,7 +269,7 @@ async function createLogStream(
 	}
 }
 
-const putEventLogs = throttle(async function putEventLogs(
+async function putEventLogs(
 	logGroupName: string,
 	logStreamName: string,
 	logEvents: Log[],
@@ -282,12 +292,23 @@ const putEventLogs = throttle(async function putEventLogs(
 				logStreamName,
 			}),
 		);
-
 		debug("putEventLogs", { logGroupName, logStreamName }, result);
+
+		if (result.$metadata.httpStatusCode !== 200) {
+			const result = await client.send(
+				new PutLogEventsCommand({
+					logEvents,
+					logGroupName,
+					logStreamName,
+				}),
+			);
+
+			debug("putEventLogs", { logGroupName, logStreamName }, result);
+		}
 	} catch (error) {
 		throw new Error("Put Log Events Failed", { cause: error });
 	}
-});
+}
 
 // ensure that logs have been _copied_ and cleared syncnorously
 export function flush(): Promise<void> {
@@ -310,7 +331,7 @@ async function _flush(
 				await putEventLogs(groupName, streamName, logs);
 			} catch (error) {
 				console.error(error);
-				await addErrorLog("cloudwatch_logger", "errors", {
+				addErrorLog("cloudwatch_logger", "errors", {
 					message: "flushing error (will retry)",
 					error: String(error),
 					_error: error,
@@ -338,7 +359,7 @@ async function _flush(
 			}
 		} catch (error) {
 			console.error(error);
-			await addErrorLog("cloudwatch_logger", "errors", {
+			addErrorLog("cloudwatch_logger", "errors", {
 				message: "flushing error",
 				error: String(error),
 				_error: error,

@@ -1,6 +1,8 @@
 import { setTimeout } from "node:timers/promises";
 // import { setup, addLog, flush } from "@purpleduck/cloudwatch-logs";
 import { Logger, setup } from "../index.ts";
+import { nanoid } from "nanoid";
+import cryptoRandomString from "crypto-random-string";
 
 console.log("Hello via Bun!");
 
@@ -11,41 +13,37 @@ setup({
 
 const logGroup = "logger-tests";
 
-const logger1 = new Logger(logGroup, "stream1");
-const logger2 = new Logger(logGroup, "stream2");
-const logger3 = new Logger(logGroup, "stream3");
-const logger4 = new Logger(logGroup, "stream4");
-const logger5 = new Logger(logGroup, "stream5");
-
-const loggers = [logger1, logger2, logger3, logger4, logger5];
-
 let i = 0;
-function getLogger(max = 5) {
+
+const routes = ["/", "/wallet", "/v2/wallet/top-up", "/v4"];
+
+function getLogger(max = 2049) {
 	i++;
+
 	if (i === max) {
 		i = 0;
 	}
 
-	// biome-ignore lint/style/noNonNullAssertion: <explanation>
-	return loggers[i]!;
+	return new Logger(
+		logGroup,
+		`${routes[i % 3]}/${cryptoRandomString({ length: 30 })}`,
+	);
 }
 
 let j = 0;
 
-while (j < 50) {
-	getLogger(3).info({ message: j });
+const logs = [];
+
+while (j < 10_000) {
+	const v = {
+		message: crypto.randomUUID(),
+		value: nanoid(2048),
+	};
+	const logger = getLogger();
+	logs.push([logger.streamName, v]);
+	logger.info(v);
+	// j % 200 === 0 && (await setTimeout(1));
 	j++;
 }
 
-await setTimeout(3000);
-
-while (j < 50) {
-	getLogger(3).info({ message: j });
-	j++;
-}
-
-while (j < 500) {
-	getLogger().info({ message: j });
-	await setTimeout(250);
-	j++;
-}
+Bun.write("test.json", JSON.stringify(logs, null, 2));
