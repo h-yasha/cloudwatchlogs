@@ -9,6 +9,13 @@ import {
 } from "@aws-sdk/client-cloudwatch-logs";
 import pThrottle from "p-throttle";
 
+const DEBUG = !!process.env.DUCK_LOGGER_DEBUG;
+function debug(message: string, ...optionalParams: unknown[]) {
+	if (DEBUG) {
+		console.debug(message, ...optionalParams);
+	}
+}
+
 export interface Log extends InputLogEvent {
 	timestamp: number;
 	message: string;
@@ -40,7 +47,7 @@ function isResourceAlreadyExistsException(
 //
 
 const throttle = pThrottle({
-	interval: 1500,
+	interval: 50,
 	limit: 1,
 });
 
@@ -75,8 +82,10 @@ export const flushInterval = new (class FlushInterval {
 	}
 
 	#intervalCallback() {
+		debug("flush interval");
 		for (const logs of bufferedLogs.values()) {
 			if (logs.length) {
+				debug("flush interval: has logs");
 				flush();
 				break;
 			}
@@ -166,6 +175,7 @@ function getOrderedLogs(): Array<
 	return all;
 }
 
+// TODO: instantly log out
 async function addErrorLog(
 	groupName: string,
 	streamName: string,
@@ -182,55 +192,72 @@ async function addErrorLog(
 /**
  * @throws {Error} if CloudWatchLogs client is not initialized.
  */
-const createLogGroup = throttle(async (logGroupName: string): Promise<void> => {
+async function createLogGroup(logGroupName: string): Promise<void> {
+	if (!client) {
+		throw new Error("CloudWatchLogs `client` is not initialized.");
+	}
+
+	if (logGroups.has(logGroupName)) {
+		return;
+	}
+
+	try {
+		const result = await client.send(
+			new CreateLogGroupCommand({ logGroupName }),
+		);
+		debug("createLogGroup", { logGroupName }, result);
+
+		logGroups.set(logGroupName, []);
+	} catch (error) {
+		if (isResourceAlreadyExistsException(error)) {
+			debug("createLogGroup", { logGroupName }, error.message);
+
+			logGroups.set(logGroupName, []);
+			return;
+		}
+
+		throw new Error("Create Log Group Failed", { cause: error });
+	}
+}
+
+/**
+ * @throws {Error} if CloudWatchLogs client is not initialized.
+ */
+async function createLogStream(
+	logGroupName: string,
+	logStreamName: string,
+): Promise<void> {
 	if (!client) {
 		throw new Error("CloudWatchLogs `client` is not initialized.");
 	}
 
 	try {
-		await client.send(new CreateLogGroupCommand({ logGroupName }));
-	} catch (error) {
-		if (isResourceAlreadyExistsException(error)) {
+		await createLogGroup(logGroupName);
+
+		const logGroup = logGroups.get(logGroupName);
+		if (logGroup?.includes(logStreamName)) {
 			return;
 		}
-		throw new Error("Create Log Group Failed", { cause: error });
+
+		const result = await client.send(
+			new CreateLogStreamCommand({
+				logGroupName,
+				logStreamName,
+			}),
+		);
+		debug("createLogStream", { logStreamName }, result);
+
+		logGroup?.push(logStreamName);
+	} catch (error) {
+		if (isResourceAlreadyExistsException(error)) {
+			debug("createLogStream", { logStreamName }, error.message);
+			logGroups.get(logGroupName)?.push(logStreamName);
+			return;
+		}
+
+		throw new Error("Create Log Stream Failed", { cause: error });
 	}
-});
-
-/**
- * @throws {Error} if CloudWatchLogs client is not initialized.
- */
-const createLogStream = throttle(
-	async (logGroupName: string, logStreamName: string): Promise<void> => {
-		if (!client) {
-			throw new Error("CloudWatchLogs `client` is not initialized.");
-		}
-
-		try {
-			await createLogGroup(logGroupName);
-
-			await client.send(
-				new CreateLogStreamCommand({
-					logGroupName,
-					logStreamName,
-				}),
-			);
-
-			const logGroup = logGroups.get(logGroupName);
-			if (!logGroup) {
-				logGroups.set(logGroupName, [logStreamName]);
-			} else {
-				logGroup.push(logStreamName);
-			}
-		} catch (error) {
-			if (isResourceAlreadyExistsException(error)) {
-				return;
-			}
-
-			throw new Error("Create Log Stream Failed", { cause: error });
-		}
-	},
-);
+}
 
 const putEventLogs = throttle(async function putEventLogs(
 	logGroupName: string,
@@ -246,28 +273,29 @@ const putEventLogs = throttle(async function putEventLogs(
 	}
 
 	try {
-		if (!logGroups.get(logGroupName)?.includes(logStreamName)) {
-			await createLogStream(logGroupName, logStreamName);
-		}
+		await createLogStream(logGroupName, logStreamName);
 
-		await client.send(
+		const result = await client.send(
 			new PutLogEventsCommand({
 				logEvents,
 				logGroupName,
 				logStreamName,
 			}),
 		);
+
+		debug("putEventLogs", { logGroupName, logStreamName }, result);
 	} catch (error) {
 		throw new Error("Put Log Events Failed", { cause: error });
 	}
 });
 
-/**
- * @throws {Error} if CloudWatchLogs throttle is not initialized.
- */
 // ensure that logs have been _copied_ and cleared syncnorously
 export function flush(): Promise<void> {
 	const entries = getOrderedLogs();
+
+	debug("flushing", {
+		entries,
+	});
 
 	return _flush(entries);
 }
@@ -275,6 +303,7 @@ export function flush(): Promise<void> {
 async function _flush(
 	entries: ReturnType<typeof getOrderedLogs>,
 ): Promise<void> {
+	debug("flusher");
 	for (const [groupName, streamName, logs] of entries) {
 		try {
 			try {
@@ -375,7 +404,7 @@ export class Logger {
 
 		bufferedLogs.set(`${streamGroup}{::}${streamName}`, []);
 
-		createLogStream(streamGroup, streamName);
+		// createLogStream(streamGroup, streamName);
 	}
 
 	private log(level: "debug" | "info" | "warn" | "error", data: LogMessage) {
@@ -384,10 +413,14 @@ export class Logger {
 			data,
 		});
 
-		void addLog(this.streamGroup, this.streamName, {
+		const result = addLog(this.streamGroup, this.streamName, {
 			timestamp: Date.now(),
 			message: JSON.stringify(obj, this.jsonReplacer),
 		});
+		// TODO: log error to loggers errors
+		if (result instanceof Error) {
+			console.error(result);
+		}
 	}
 
 	//
