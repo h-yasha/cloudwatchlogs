@@ -94,7 +94,7 @@ export class CloudWatchLogger {
 
 		this._flushInterval = value;
 		this.flushIntervalInterval = setInterval(
-			this.intervalCallback,
+			this.intervalCallback.bind(this),
 			this._flushInterval,
 		);
 	}
@@ -204,7 +204,6 @@ export class CloudWatchLogger {
 	// ensure that logs have been _copied_ and cleared syncnorously
 	flush(): Promise<void> {
 		const entries = this.getOrderedLogs();
-		console.log("flush");
 		// debug("flushing", { entries });
 		return this._flush(entries);
 	}
