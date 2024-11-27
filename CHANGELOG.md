@@ -1,5 +1,11 @@
 # @purpleduck/cloudwatch-logs
 
+## 1.0.0
+
+### Major Changes
+
+- f7a9612: Major refactor
+
 ## 0.2.1
 
 ### Patch Changes
