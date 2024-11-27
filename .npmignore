@@ -1,5 +1,5 @@
 *
 
-!src
-!dist
+!src/**
+!dist/**
 !package.json
