@@ -4,10 +4,10 @@ import {
 	CreateLogGroupCommand,
 	CreateLogStreamCommand,
 	type InputLogEvent,
+	InvalidParameterException,
 	PutLogEventsCommand,
 	ResourceAlreadyExistsException,
 } from "@aws-sdk/client-cloudwatch-logs";
-// import pThrottle from "p-throttle";
 
 const DEBUG = !!process.env.DUCK_LOGGER_DEBUG;
 function debug(message: string, ...optionalParams: unknown[]) {
@@ -16,449 +16,416 @@ function debug(message: string, ...optionalParams: unknown[]) {
 	}
 }
 
+export interface Config extends CloudWatchLogsClientConfig {
+	/**
+	 * When set to 0 it will be disabled.
+	 */
+	flushInterval: number;
+	/**
+	 * The maximum max message size of cloudwatch is 256 Kb
+	 */
+	overSizedMessageAction: "clip" | "error" | "console";
+}
+
 export interface Log extends InputLogEvent {
 	timestamp: number;
 	message: string;
 }
 
+type OrderedLogs = Array<
+	[streamGroup: string, streamName: string, logs: Log[]]
+>;
+
 // https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/cloudwatch_limits_cwl.html
 // https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutLogEvents.html
 export const CLOUDWATCH_FIXED_EVENT_PREFIX = 26 /* byte */;
-export const CLOUDWATCH_MAX_EVENT_SIZE =
-	2 ** 18 - CLOUDWATCH_FIXED_EVENT_PREFIX /* byte */; // 256 KB - 26 bytes.
+export const CLOUDWATCH_MAX_EVENT_SIZE = 2 ** 18 -
+	CLOUDWATCH_FIXED_EVENT_PREFIX /* byte */; // 256 KB - 26 bytes.
 
 export const CLOUDWTACH_MAX_BUFFER_LENGTH = 10_000;
 export const CLOUDWATCH_MAX_BUFFER_SIZE = 2 ** 20 /* byte */; // 1 MB
 
-function isResourceAlreadyExistsException(
-	error: unknown,
-): error is ResourceAlreadyExistsException {
-	if (error instanceof ResourceAlreadyExistsException) {
-		return true;
-	}
-
-	if (error instanceof Error) {
-		return error.name === "ResourceAlreadyExistsException";
-	}
-
-	return false;
-}
-
-//
-
-// const throttle = pThrottle({
-// 	interval: 50,
-// 	limit: 1,
-// });
-
-let client: CloudWatchLogsClient | undefined;
-
-/**
- * When {true} will clip messages to fit into the maximum max message size of cloudwatch (256 Kb)
- *
- * When {false} will return error on {@link addLog}
- *
- * @default {true}
- **/
-// biome-ignore lint/style/useConst: <explanation>
-export let clipMessages = true;
-
-// TODO: use Proxy?
-export const flushInterval = new (class FlushInterval {
-	#value = 1000;
-	#interval: NodeJS.Timeout | undefined = undefined;
-
-	get value() {
-		return this.#value;
-	}
-
-	set value(value) {
-		if (this.#interval) {
-			clearInterval(this.#interval);
+export class CloudWatchLogger {
+	private static isResourceAlreadyExistsException(
+		error: unknown,
+	): error is ResourceAlreadyExistsException {
+		if (error instanceof ResourceAlreadyExistsException) {
+			return true;
 		}
-		this.#interval = setInterval(this.#intervalCallback, value);
 
-		this.#value = value;
+		if (error instanceof Error) {
+			return error.name === "ResourceAlreadyExistsException";
+		}
+
+		return false;
 	}
 
-	#intervalCallback() {
+	static logEventExceedsSize(log: Log): boolean {
+		return Buffer.byteLength(log.message, "utf-8") >
+			CLOUDWATCH_MAX_EVENT_SIZE;
+	}
+
+	//-------------------------------------------------------------------------
+
+	readonly client: CloudWatchLogsClient;
+	private readonly overSizedMessageAction: Config["overSizedMessageAction"];
+
+	private _flushInterval = 0;
+	private flushIntervalInterval: NodeJS.Timeout | undefined = undefined;
+	private intervalCallback() {
 		debug("flush interval");
-		for (const logs of bufferedLogs.values()) {
+		for (const logs of this.bufferedLogs.values()) {
 			if (logs.length) {
 				debug("flush interval: has logs");
-				flush();
+				this.flush();
 				break;
 			}
 		}
 	}
-})();
 
-export function setup(
-	config: CloudWatchLogsClientConfig & {
-		/** @default 1000 */
-		flushInterval: number;
-	},
-): void {
-	if (client) {
-		return;
-	}
-	client = new CloudWatchLogsClient(config);
-
-	flushInterval.value = config.flushInterval ?? 1000;
-}
-
-// ----------------------------------------------------------------------------
-
-const logGroups = new Map<string, string[]>();
-const bufferedLogs = new Map<`${string}{::}${string}`, Log[]>();
-
-//----------------------------------------------------------------------------
-
-function pushLog(logGroupName: string, logStreamName: string, log: Log): void {
-	const key = `${logGroupName}{::}${logStreamName}` as const;
-	if (!bufferedLogs.has(key)) {
-		bufferedLogs.set(key, []);
+	private get flushInterval() {
+		return this._flushInterval;
 	}
 
-	bufferedLogs.get(key)?.push(log);
-}
+	private set flushInterval(value) {
+		if (this.flushIntervalInterval) {
+			clearInterval(this.flushIntervalInterval);
+		}
 
-function reachedBufferLimits(
-	logGroup: string,
-	logStream: string,
-	newLog: Log,
-): boolean {
-	const logs = bufferedLogs.get(`${logGroup}{::}${logStream}`);
-	if (!logs) {
-		return false;
-	}
-
-	if (logs.length + 1 >= CLOUDWTACH_MAX_BUFFER_LENGTH) {
-		return true;
-	}
-
-	const size = logs.reduce(
-		(accumulator, log) =>
-			accumulator +
-			Buffer.byteLength(log.message, "utf-8") +
-			CLOUDWATCH_FIXED_EVENT_PREFIX,
-		0,
-	);
-
-	const messageSize =
-		Buffer.byteLength(newLog.message, "utf-8") + CLOUDWATCH_FIXED_EVENT_PREFIX;
-
-	return size + messageSize >= CLOUDWATCH_MAX_BUFFER_SIZE - 1024;
-}
-
-function logEventExceedsSize(log: Log): boolean {
-	return Buffer.byteLength(log.message, "utf-8") >= CLOUDWATCH_MAX_EVENT_SIZE;
-}
-
-function getOrderedLogs(): Array<
-	[streamGroup: string, streamName: string, logs: Log[]]
-> {
-	const all: Array<[streamGroup: string, streamName: string, logs: Log[]]> = [];
-
-	for (const [key, value] of bufferedLogs.entries()) {
-		const [streamGroup, streamName] = key.split("{::}") as [string, string];
-
-		bufferedLogs.set(key, []);
-
-		all.push([
-			streamGroup,
-			streamName,
-			value.sort((a, b) => a.timestamp - b.timestamp),
-		]);
-	}
-
-	return all;
-}
-
-// TODO: instantly log out
-function addErrorLog(
-	groupName: string,
-	streamName: string,
-	errorLog: { message: string; error: string } & Record<string, unknown>,
-): void {
-	if (!client) {
-		throw new Error("CloudWatchLogs `client` is not initialized.");
-	}
-
-	client.send(
-		new PutLogEventsCommand({
-			logGroupName: groupName,
-			logStreamName: streamName,
-			logEvents: [
-				{
-					timestamp: Date.now(),
-					message: JSON.stringify(errorLog),
-				},
-			],
-		}),
-	);
-}
-
-/**
- * @throws {Error} if CloudWatchLogs client is not initialized.
- */
-async function createLogGroup(logGroupName: string): Promise<void> {
-	if (!client) {
-		throw new Error("CloudWatchLogs `client` is not initialized.");
-	}
-
-	if (logGroups.has(logGroupName)) {
-		return;
-	}
-
-	try {
-		const result = await client.send(
-			new CreateLogGroupCommand({ logGroupName }),
+		this._flushInterval = value;
+		this.flushIntervalInterval = setInterval(
+			this.intervalCallback,
+			this._flushInterval,
 		);
-		debug("createLogGroup", { logGroupName }, result);
+	}
 
-		logGroups.set(logGroupName, []);
-	} catch (error) {
-		if (isResourceAlreadyExistsException(error)) {
-			debug("createLogGroup", { logGroupName }, error.message);
+	private readonly logGroups = new Map<string, string[]>();
+	private readonly bufferedLogs = new Map<`${string}{::}${string}`, Log[]>();
 
-			logGroups.set(logGroupName, []);
+	constructor(config: Config) {
+		this.client = new CloudWatchLogsClient(config);
+
+		this.flushInterval = config.flushInterval;
+		this.overSizedMessageAction = config.overSizedMessageAction;
+	}
+
+	private pushLog(
+		logGroupName: string,
+		logStreamName: string,
+		log: Log,
+	): void {
+		const key = `${logGroupName}{::}${logStreamName}` as const;
+
+		if (!this.bufferedLogs.has(key)) {
+			this.bufferedLogs.set(key, []);
+		}
+
+		this.bufferedLogs.get(key)?.push(log);
+	}
+
+	private reachedBufferLimits(
+		logGroup: string,
+		logStream: string,
+		newLog: Log,
+	): boolean {
+		const logs = this.bufferedLogs.get(`${logGroup}{::}${logStream}`);
+		if (!logs) {
+			debug(
+				"[reachedBufferLimits]",
+				false,
+				`${logGroup}{::}${logStream}`,
+				"`logStream` not in buffered logs",
+			);
+
+			return false;
+		}
+
+		if (logs.length + 1 >= CLOUDWTACH_MAX_BUFFER_LENGTH) {
+			debug(
+				"[reachedBufferLimits]",
+				true,
+				{ length: logs.length },
+				"more than CLOUDWTACH_MAX_BUFFER_LENGTH",
+			);
+
+			return true;
+		}
+
+		const bufferSize = logs.reduce(
+			(accumulator, log) =>
+				accumulator +
+				Buffer.byteLength(log.message, "utf-8") +
+				CLOUDWATCH_FIXED_EVENT_PREFIX,
+			0,
+		);
+
+		const messageSize = Buffer.byteLength(newLog.message, "utf-8") +
+			CLOUDWATCH_FIXED_EVENT_PREFIX;
+
+		const totalSize = bufferSize + messageSize;
+		const result = totalSize >= CLOUDWATCH_MAX_BUFFER_SIZE;
+
+		debug(
+			"[reachedBufferLimits]",
+			"bufferSize",
+			bufferSize,
+			"messageSize",
+			messageSize,
+			"totalSize",
+			totalSize,
+			"result",
+			result,
+		);
+
+		return result;
+	}
+
+	private getOrderedLogs(): OrderedLogs {
+		const all: OrderedLogs = [];
+
+		for (const [key, value] of this.bufferedLogs.entries()) {
+			const [streamGroup, streamName] = key.split("{::}") as [
+				string,
+				string,
+			];
+
+			this.bufferedLogs.set(key, []);
+
+			all.push([
+				streamGroup,
+				streamName,
+				value.sort((a, b) => a.timestamp - b.timestamp),
+			]);
+		}
+
+		return all;
+	}
+
+	// ensure that logs have been _copied_ and cleared syncnorously
+	flush(): Promise<void> {
+		const entries = this.getOrderedLogs();
+		console.log("flush");
+		// debug("flushing", { entries });
+		return this._flush(entries);
+	}
+
+	private async _flush(entries: OrderedLogs): Promise<void> {
+		debug("flusher");
+
+		for (const [groupName, streamName, logs] of entries) {
+			try {
+				try {
+					await this.putEventLogs(groupName, streamName, logs);
+				} catch (error) {
+					console.error(error);
+					this.logError("cloudwatch_logger", "errors", {
+						message: "flushing error (will retry)",
+						error: String(error),
+						_error: error,
+						cause: String((error as Error).cause),
+						groupName,
+						streamName,
+						logsCount: logs.length,
+						logsRawTotalSize: logs.reduce(
+							(acc, log) => acc + Buffer.byteLength(log.message),
+							0,
+						),
+					});
+
+					if (!logs.length) {
+						continue;
+					}
+
+					const half = Math.ceil(logs.length / 2);
+
+					while (logs.length) {
+						const partial = logs.splice(0, half);
+
+						if (error instanceof InvalidParameterException) {
+							for (const record of partial) {
+								record.message = Buffer.from(record.message)
+									.subarray(0, CLOUDWATCH_MAX_EVENT_SIZE)
+									.toString();
+							}
+						}
+
+						await this.putEventLogs(groupName, streamName, partial);
+					}
+				}
+			} catch (error) {
+				console.error(error);
+				this.logError("cloudwatch_logger", "errors", {
+					message: "flushing error",
+					error: String(error),
+					_error: error,
+					cause: String((error as Error).cause),
+					stack: String((error as Error).stack),
+				});
+			}
+		}
+	}
+
+	/**
+	 * can return {@link Error} when {@link overSizedMessageAction} is set to `error`.
+	 */
+	log(
+		logGroupName: string,
+		logStreamName: string,
+		log: Log,
+	): Error | undefined {
+		if (this.reachedBufferLimits(logGroupName, logStreamName, log)) {
+			this.flush();
+		}
+
+		let log_ = log;
+
+		if (CloudWatchLogger.logEventExceedsSize(log)) {
+			switch (this.overSizedMessageAction) {
+				case "clip": {
+					const message = Buffer.from(log.message)
+						.subarray(0, CLOUDWATCH_MAX_EVENT_SIZE)
+						.toString();
+
+					log_ = { timestamp: log.timestamp, message };
+
+					break;
+				}
+
+				case "error": {
+					return new Error("Log event exceeds size limit: 256Kb");
+				}
+
+				case "console": {
+					try {
+						console.info(JSON.parse(log.message));
+					} catch {
+						console.info(log.message);
+					}
+
+					return;
+				}
+			}
+		}
+
+		this.pushLog(logGroupName, logStreamName, log_);
+
+		return;
+	}
+
+	private logError(
+		groupName: string,
+		streamName: string,
+		log: { message: string; error: string } & Record<string, unknown>,
+	): void {
+		try {
+			this.client.send(
+				new PutLogEventsCommand({
+					logGroupName: groupName,
+					logStreamName: streamName,
+					logEvents: [
+						{
+							timestamp: Date.now(),
+							message: JSON.stringify(log),
+						},
+					],
+				}),
+			);
+		} catch (error) {
+			console.error(error);
+			console.error(log);
+		}
+	}
+
+	async createLogGroup(logGroupName: string): Promise<void> {
+		if (this.logGroups.has(logGroupName)) {
 			return;
 		}
 
-		throw new Error("Create Log Group Failed", { cause: error });
+		try {
+			const result = await this.client.send(
+				new CreateLogGroupCommand({ logGroupName }),
+			);
+			debug("createLogGroup", { logGroupName }, result);
+
+			this.logGroups.set(logGroupName, []);
+		} catch (error) {
+			if (CloudWatchLogger.isResourceAlreadyExistsException(error)) {
+				debug("createLogGroup", { logGroupName }, error.message);
+
+				this.logGroups.set(logGroupName, []);
+				return;
+			}
+
+			throw new Error("Create Log Group Failed", { cause: error });
+		}
 	}
-}
 
-/**
- * @throws {Error} if CloudWatchLogs client is not initialized.
- */
-async function createLogStream(
-	logGroupName: string,
-	logStreamName: string,
-): Promise<void> {
-	if (!client) {
-		throw new Error("CloudWatchLogs `client` is not initialized.");
+	async createLogStream(
+		logGroupName: string,
+		logStreamName: string,
+	): Promise<void> {
+		try {
+			await this.createLogGroup(logGroupName);
+
+			const logGroup = this.logGroups.get(logGroupName);
+			if (logGroup?.includes(logStreamName)) {
+				return;
+			}
+
+			const result = await this.client.send(
+				new CreateLogStreamCommand({
+					logGroupName,
+					logStreamName,
+				}),
+			);
+			debug("createLogStream", { logStreamName }, result);
+
+			logGroup?.push(logStreamName);
+		} catch (error) {
+			if (CloudWatchLogger.isResourceAlreadyExistsException(error)) {
+				debug("createLogStream", { logStreamName }, error.message);
+				this.logGroups.get(logGroupName)?.push(logStreamName);
+				return;
+			}
+
+			throw new Error("Create Log Stream Failed", { cause: error });
+		}
 	}
 
-	try {
-		await createLogGroup(logGroupName);
-
-		const logGroup = logGroups.get(logGroupName);
-		if (logGroup?.includes(logStreamName)) {
+	async putEventLogs(
+		logGroupName: string,
+		logStreamName: string,
+		logEvents: Log[],
+	): Promise<void> {
+		if (logEvents.length === 0) {
 			return;
 		}
 
-		const result = await client.send(
-			new CreateLogStreamCommand({
-				logGroupName,
-				logStreamName,
-			}),
-		);
-		debug("createLogStream", { logStreamName }, result);
+		try {
+			await this.createLogStream(logGroupName, logStreamName);
 
-		logGroup?.push(logStreamName);
-	} catch (error) {
-		if (isResourceAlreadyExistsException(error)) {
-			debug("createLogStream", { logStreamName }, error.message);
-			logGroups.get(logGroupName)?.push(logStreamName);
-			return;
-		}
-
-		throw new Error("Create Log Stream Failed", { cause: error });
-	}
-}
-
-async function putEventLogs(
-	logGroupName: string,
-	logStreamName: string,
-	logEvents: Log[],
-): Promise<void> {
-	if (logEvents.length === 0) {
-		return;
-	}
-
-	if (!client) {
-		throw new Error("CloudWatchLogs client is not initialized.");
-	}
-
-	try {
-		await createLogStream(logGroupName, logStreamName);
-
-		const result = await client.send(
-			new PutLogEventsCommand({
-				logEvents,
-				logGroupName,
-				logStreamName,
-			}),
-		);
-		debug("putEventLogs", { logGroupName, logStreamName }, result);
-
-		if (result.$metadata.httpStatusCode !== 200) {
-			const result = await client.send(
+			const result = await this.client.send(
 				new PutLogEventsCommand({
 					logEvents,
 					logGroupName,
 					logStreamName,
 				}),
 			);
-
 			debug("putEventLogs", { logGroupName, logStreamName }, result);
-		}
-	} catch (error) {
-		throw new Error("Put Log Events Failed", { cause: error });
-	}
-}
 
-// ensure that logs have been _copied_ and cleared syncnorously
-export function flush(): Promise<void> {
-	const entries = getOrderedLogs();
+			if (result.$metadata.httpStatusCode !== 200) {
+				const result = await this.client.send(
+					new PutLogEventsCommand({
+						logEvents,
+						logGroupName,
+						logStreamName,
+					}),
+				);
 
-	debug("flushing", {
-		entries,
-	});
-
-	return _flush(entries);
-}
-
-async function _flush(
-	entries: ReturnType<typeof getOrderedLogs>,
-): Promise<void> {
-	debug("flusher");
-	for (const [groupName, streamName, logs] of entries) {
-		try {
-			try {
-				await putEventLogs(groupName, streamName, logs);
-			} catch (error) {
-				console.error(error);
-				addErrorLog("cloudwatch_logger", "errors", {
-					message: "flushing error (will retry)",
-					error: String(error),
-					_error: error,
-					cause: String((error as Error).cause),
-					stack: String((error as Error).stack),
-					groupName,
-					streamName,
-					logsCount: logs.length,
-					logsRawTotalSize: logs.reduce(
-						(acc, log) => acc + Buffer.byteLength(log.message),
-						0,
-					),
-				});
-
-				if (!logs.length) {
-					continue;
-				}
-
-				const half = logs.length / 2;
-
-				while (logs.length) {
-					const partial = logs.splice(0, half);
-					await putEventLogs(groupName, streamName, partial);
-				}
+				debug("putEventLogs", { logGroupName, logStreamName }, result);
 			}
 		} catch (error) {
-			console.error(error);
-			addErrorLog("cloudwatch_logger", "errors", {
-				message: "flushing error",
-				error: String(error),
-				_error: error,
-				cause: String((error as Error).cause),
-				stack: String((error as Error).stack),
-			});
+			throw new Error("Put Log Events Failed", { cause: error });
 		}
-	}
-}
-
-/**
- * internal function used to add log messages to the buffer.
- *
- * can return {@link Error} when {@link clipMessages} is set to false.
- **/
-export function addLog(
-	logGroupName: string,
-	logStreamName: string,
-	log: Log,
-): Error | undefined {
-	if (reachedBufferLimits(logGroupName, logStreamName, log)) {
-		flush();
-	}
-
-	let log_ = log;
-
-	if (logEventExceedsSize(log)) {
-		if (clipMessages) {
-			const message = Buffer.from(log.message)
-				.slice(0, CLOUDWATCH_MAX_EVENT_SIZE)
-				.toString();
-
-			log_ = { timestamp: log.timestamp, message };
-		} else {
-			return new Error("Log event exceeds size limit: 256Kb");
-		}
-	}
-
-	setImmediate(pushLog, logGroupName, logStreamName, log_);
-
-	return;
-}
-
-// ----------------------------------------------------------------------------
-
-export type LogMessage = object | Record<string, unknown>;
-
-export class Logger {
-	readonly streamGroup: string;
-	readonly streamName: string;
-	// biome-ignore lint/suspicious/noExplicitAny: <explanation>
-	readonly jsonReplacer?: (this: any, key: string, value: any) => any;
-
-	constructor(
-		streamGroup: string,
-		streamName: string,
-		// biome-ignore lint/suspicious/noExplicitAny: <explanation>
-		jsonReplacer?: (this: any, key: string, value: any) => any,
-	) {
-		this.streamGroup = streamGroup;
-		this.streamName = streamName;
-		this.jsonReplacer = jsonReplacer;
-
-		bufferedLogs.set(`${streamGroup}{::}${streamName}`, []);
-
-		// createLogStream(streamGroup, streamName);
-	}
-
-	private log(level: "debug" | "info" | "warn" | "error", data: LogMessage) {
-		const obj = Object.assign({
-			level: level.toUpperCase(),
-			data,
-		});
-
-		const result = addLog(this.streamGroup, this.streamName, {
-			timestamp: Date.now(),
-			message: JSON.stringify(obj, this.jsonReplacer),
-		});
-		// TODO: log error to loggers errors
-		if (result instanceof Error) {
-			console.error(result);
-		}
-	}
-
-	//
-
-	debug(obj: LogMessage) {
-		this.log("debug", obj);
-	}
-
-	info(obj: LogMessage) {
-		this.log("info", obj);
-	}
-
-	warn(obj: LogMessage) {
-		this.log("warn", obj);
-	}
-
-	error(obj: LogMessage) {
-		this.log("error", obj);
 	}
 }
