@@ -271,6 +271,7 @@ export class CloudWatchLogger {
 		logGroupName: string,
 		logStreamName: string,
 		log: Log,
+		options?: { overSizedMessageAction?: Config["overSizedMessageAction"] },
 	): Error | undefined {
 		if (this.reachedBufferLimits(logGroupName, logStreamName, log)) {
 			this.flush();
@@ -279,7 +280,9 @@ export class CloudWatchLogger {
 		let log_ = log;
 
 		if (CloudWatchLogger.logEventExceedsSize(log)) {
-			switch (this.overSizedMessageAction) {
+			switch (
+			options?.overSizedMessageAction ?? this.overSizedMessageAction
+			) {
 				case "clip": {
 					const message = Buffer.from(log.message)
 						.subarray(0, CLOUDWATCH_MAX_EVENT_SIZE)

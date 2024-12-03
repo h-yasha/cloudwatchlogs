@@ -17,7 +17,7 @@
 	"scripts": {
 		"build": "tsup src/index.ts --format cjs,esm --dts",
 		"release": "bun run build && changeset publish",
-		"lint": "tsc && biome lint .",
+		"lint": "tsc && biome lint src",
 		"prepare": "husky"
 	},
 	"devDependencies": {
@@ -32,8 +32,5 @@
 	"peerDependencies": {
 		"@aws-sdk/client-cloudwatch-logs": "^3.540.0"
 	},
-	"trustedDependencies": [
-		"@biomejs/biome",
-		"esbuild"
-	]
+	"trustedDependencies": ["@biomejs/biome", "esbuild"]
 }
