@@ -1,5 +1,11 @@
 # @purpleduck/cloudwatch-logs
 
+## 1.1.0
+
+### Minor Changes
+
+- edec112: add custom options for log method
+
 ## 1.0.0
 
 ### Major Changes
